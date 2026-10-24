@@ -2,6 +2,8 @@
 
 **Adaptive Speech Segmentation via Reinforcement Learning**
 
+[Paper (arXiv:2610.14309)](https://arxiv.org/abs/2610.14309) · [Citation](#citation)
+
 > **WIP branch: adaptive training.** The validation-driven rate curriculum is
 > experimental. The fixed-band release is on [`main`](https://github.com/BorrisonXiao/ASSET/tree/main).
 
@@ -258,3 +260,21 @@ Datasets, model weights, experiment outputs, reports, debug tools, baseline
 launchers, manuscript drafts, and the research workspace's test suite are not
 part of this release. The runtime subset retains original author notices;
 see [NOTICE](NOTICE) and the [Apache-2.0 license](LICENSE).
+
+## Citation
+
+If you use ASSET in your research, please cite our
+[paper](https://arxiv.org/abs/2610.14309):
+
+```bibtex
+@misc{xiao2026asset,
+  title         = {{ASSET}: Adaptive Speech Segmentation via Reinforcement Learning},
+  author        = {Xiao, Cihan and Tseng, Yuan and Wiesner, Matthew and Raj, Desh and
+                   Garcia Perera, Leibny Paola and Khudanpur, Sanjeev and Harwath, David},
+  year          = {2026},
+  eprint        = {2610.14309},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CL},
+  url           = {https://arxiv.org/abs/2610.14309}
+}
+```
