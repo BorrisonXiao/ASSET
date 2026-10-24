@@ -2,6 +2,90 @@
 
 **Adaptive Speech Segmentation via Reinforcement Learning**
 
+> **WIP branch: adaptive training.** The validation-driven rate curriculum is
+> experimental. The fixed-band release is on [`main`](https://github.com/BorrisonXiao/ASSET/tree/main).
+
+## Adaptive continuation (WIP)
+
+This feature continues a completed LS960 Transformer-AR/BiGRU checkpoint with
+both policy and recognizer trainable. It validates dev-clean and dev-other at
+step zero and every 500 new updates. The rate upper target decreases by 0.5 Hz
+after two consecutive checks satisfy the rate and WER guards. The quality guard
+uses the initial WER +0.1 percentage point, plus an EMA of dev-other WER with
+alpha 0.2. Failed checks hold the target; the rate penalty remains active.
+Training stops after 8,000 additional updates, regardless of target attainment.
+Test data never controls the curriculum or checkpoint selection.
+
+Preliminary three-seed LS960 results show superior compression efficiency:
+
+| Continuation | Test-clean WER (%) | Test-other WER (%) | Clean rate (Hz) | Other rate (Hz) |
+|---|---:|---:|---:|---:|
+| Original fixed band | 2.4473 | 5.0959 | 11.2851 | 10.9467 |
+| Fixed lower target | 2.4650 | 5.0640 | 9.8589 | 9.5952 |
+| Adaptive target | 2.4853 | 5.1519 | 9.1558 | 8.9260 |
+
+These are means for seeds 3407/3408/3409, each continued for 8,000 updates from
+its own step-24,000 checkpoint. Adaptive uses 18.9%/18.5% fewer audio tokens than
+the original-band control with +0.0380/+0.0560 WER percentage points. Against
+the lower-target control, test-other rate is about 7% lower with +0.0879 WER
+points. This is a compression/accuracy tradeoff; lower WER, statistical
+significance, and a minimum feasible rate have not been established.
+
+The table uses the historical main scorer's literal-space tokenization.
+Whitespace-normalized diagnostics differ by one insertion in eight split/run
+results (about 0.0019 WER point). Historical continuations used **reward-side**
+rate penalties. The code here defaults to **auxiliary-only** penalties, as does
+`main`; no new auxiliary continuation was run to reproduce this table. Detailed
+curves and provenance are in the
+[published experiment record](https://borrisonxiao.github.io/jsalt26-downsampling/reports/segmenter-training-standalone.html#adaptive-frequency-results).
+
+### Run the continuation
+
+Complete the installation and data setup below, including `dev-other`.
+The source checkpoint must contain `segmenter.ckpt`, `llm.ckpt`, `proj.ckpt`,
+`normalize.ckpt`, `model_optimizer.ckpt`, and `CKPT.yaml`, all from the same run.
+The architecture and optimizer parameter groups must match the final system.
+
+```bash
+export DATA_ROOT=/path/to/LibriSpeech
+export MODEL_CACHE=/path/to/model-cache
+export OUTPUT_ROOT=/path/to/results/asset_ls960_adaptive
+export SEED=3407
+bash scripts/train_adaptive.sh /path/to/source/save/CKPT+...
+```
+
+This uses **1 × A100 80 GB** with WavLM, policy, BiGRU, projection, and Llama/LoRA
+on the same GPU. It runs one continuation, with no overlapping jobs or job
+submission (maximum one GPU). Policy/pooler LR is 5e-6 and decoder LR is 2e-5.
+The source AdamW moments are restored; learning rates are then set explicitly.
+All three training splits remain active. The resolved rate channels are logged.
+
+[`configs/adaptive.yaml`](configs/adaptive.yaml) contains controller defaults.
+The launcher writes a resolved copy to the output directory and refuses
+configuration changes when that directory is resumed. `continuation_config.json`
+records the rate channel; the trainer rejects silent channel changes on resume.
+Every validation snapshot is retained (roughly 5 GB for 17 adapter checkpoints,
+plus cache and other run products). `frequency_events.jsonl` records decisions;
+`selected_checkpoint.json` identifies the dev-selected checkpoint, which may
+differ from the final-budget checkpoint. The source checkpoint is untouched.
+
+Tests are deliberately skipped during continuation. To evaluate a specific
+saved snapshot afterwards, use a fresh output directory and the standard
+trainer's checkpoint loader:
+
+```bash
+SEGMENTER_CHECKPOINT=/path/to/continuation/save/CKPT+continuation-step-008000/segmenter.ckpt \
+DECODER_CHECKPOINT_DIR=/path/to/continuation/save/CKPT+continuation-step-008000 \
+OUTPUT_ROOT=/path/to/results/asset_ls960_adaptive_test \
+bash scripts/train.sh joint --eval_only True
+```
+
+This loads that snapshot's policy, BiGRU, LoRA, projection, and normalization,
+then evaluates both test splits without optimizer updates. Choose the step-8,000
+snapshot for final-budget comparisons, or the manifest's selected snapshot for
+an explicitly labeled development-selected comparison.
+
+
 ASSET learns hard, variable-length speech segments from transcription feedback.
 A frozen WavLM-Large encoder produces frame features; a local-history
 autoregressive Transformer predicts segment boundaries; a residual BiGRU pools
