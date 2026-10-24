@@ -2,7 +2,7 @@
 
 **Adaptive Speech Segmentation via Reinforcement Learning**
 
-[Paper (arXiv:2610.14309)](https://arxiv.org/abs/2610.14309) · [Citation](#citation)
+[![arXiv](https://img.shields.io/badge/arXiv-2610.14309-B31B1B?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2610.14309)
 
 > **WIP branch: adaptive training.** The validation-driven rate curriculum is
 > experimental. The fixed-band release is on [`main`](https://github.com/BorrisonXiao/ASSET/tree/main).
