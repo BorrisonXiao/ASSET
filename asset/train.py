@@ -609,7 +609,7 @@ class SegmenterASR(ASR):
         )
 
     def _sampled_rate_terms(self, sampled, pad_mask):
-        """Rate penalties and ratios ``(B, K)`` for full-prefix AR rollouts."""
+        """Rate penalties and ratios ``(B, K)`` for sampled boundary sequences."""
         K = len(sampled)
         B = pad_mask.size(0)
         boundary_cat = torch.cat(sampled, dim=0)
@@ -903,19 +903,16 @@ class SegmenterASR(ASR):
                 if not full_ar:
                     sampled.append(bk)
             quality_rewards = torch.stack(quality_rewards, dim=1)
-            if full_ar:
-                rate_penalties, sampled_rhos = self._sampled_rate_terms(
-                    sampled, pad_mask
-                )
-                rewards = (
-                    quality_rewards - rate_penalties
-                    if "reward" in self._rate_channels()
-                    else quality_rewards
-                )
-                out["rate_penalties"] = rate_penalties
-                out["sampled_rhos"] = sampled_rhos
-            else:
-                rewards = quality_rewards
+            rate_penalties, sampled_rhos = self._sampled_rate_terms(
+                sampled, pad_mask
+            )
+            rewards = (
+                quality_rewards - rate_penalties
+                if "reward" in self._rate_channels()
+                else quality_rewards
+            )
+            out["rate_penalties"] = rate_penalties
+            out["sampled_rhos"] = sampled_rhos
             out["quality_rewards"] = quality_rewards
             out["rewards"] = rewards
             out["sampled_boundaries"] = sampled
@@ -1050,11 +1047,7 @@ class SegmenterASR(ASR):
             # the leading indicator, so they are logged every step.
             reward_std=reward_std.mean(),
             zero_variance_share=(reward_std <= 1e-6).float().mean(),
-            sampled_rate_penalty=(
-                predictions["rate_penalties"].mean()
-                if predictions["full_ar"]
-                else 0.0
-            ),
+            sampled_rate_penalty=predictions["rate_penalties"].mean(),
             exp_rho=rho_bar.mean(),
         )
         return total
@@ -1217,11 +1210,6 @@ class SegmenterASR(ASR):
             getattr(self.hparams, "freeze_decoder_in_joint", False)
         )
         pg_weight = float(self.hparams.pg_weight)
-        rate_mode = getattr(self.hparams, "rate_mode", None) or (
-            "pin"
-            if bool(getattr(self.hparams, "rate_two_sided", False))
-            else "captax"
-        )
 
         # --- 1. rollout: generate ONCE (no grad) -- feats, old policy, K samples, decode.
         with torch.no_grad(), self.training_ctx:
@@ -1237,9 +1225,17 @@ class SegmenterASR(ASR):
                 )
                 for _ in range(K)
             ]
-            rewards = self._rollout_rewards(
+            quality_rewards = self._rollout_rewards(
                 feats, pad_mask, sampled, batch, reward_kind
             )  # (B, K)
+            rate_penalties, _ = self._sampled_rate_terms(
+                sampled, pad_mask
+            )
+            rewards = (
+                quality_rewards - rate_penalties
+                if "reward" in self._rate_channels()
+                else quality_rewards
+            )
         adv = group_advantage(
             rewards, normalize_std=bool(self.hparams.grpo_normalize_std)
         )
@@ -1257,6 +1253,7 @@ class SegmenterASR(ASR):
                     )
                     pg = pg + grpo_pg_loss(policy_logits, bk, adv[:, k])
                 pg = pg / K
+                aux_rho_lo, aux_rho_hi = self._rate_band()
                 rl_rate, rho_bar = rate_loss(
                     logits,
                     pad_mask,
@@ -1267,13 +1264,15 @@ class SegmenterASR(ASR):
                     lambda_floor=float(
                         getattr(self.hparams, "lambda_floor", 0.0)
                     ),
-                    mode=rate_mode,
-                    rho_lo=float(getattr(self.hparams, "rho_lo", 0.0)),
-                    rho_hi=float(getattr(self.hparams, "rho_hi", 1.0)),
+                    mode=self._rate_mode(),
+                    rho_lo=aux_rho_lo,
+                    rho_hi=aux_rho_hi,
                     probabilities=self.modules.segmenter.boundary_marginals(
                         logits, pad_mask
                     ),
                 )
+                if "aux" not in self._rate_channels():
+                    rl_rate = rl_rate * 0.0
                 total = pg_weight * pg + rl_rate
                 if not freeze_dec:
                     argmax_b = self.modules.segmenter.sample_boundary(
@@ -1310,8 +1309,10 @@ class SegmenterASR(ASR):
             entropy=0.0,
             beta_h=0.0,
             reward=rewards.mean(),
+            quality_reward=quality_rewards.mean(),
             reward_std=reward_std.mean(),
             zero_variance_share=(reward_std <= 1e-6).float().mean(),
+            sampled_rate_penalty=rate_penalties.mean(),
             exp_rho=rho_bar.mean(),
         )
         self.on_fit_batch_end(batch, {}, total, should_step=should_step)
