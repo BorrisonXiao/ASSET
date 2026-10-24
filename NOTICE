@@ -1,0 +1,13 @@
+ASSET includes a reduced, locally modified SpeechBrain runtime under speechbrain/.
+SpeechBrain is distributed under the Apache License, Version 2.0 (see LICENSE).
+Upstream source: https://github.com/speechbrain/speechbrain
+Original base revision: da704dd9fd710df5c6c93ea2d31a028837d93d85
+
+Original author notices are retained in the source files. Local changes include
+SpeechLLM/Hugging Face integration, batch sampling and runtime support. This
+release retains only the transitive runtime required by ASSET, simplifies package
+initializers, and resolves legacy Hugging Face import paths directly. It is not
+a complete distribution of the SpeechBrain toolkit.
+
+The shared SpeechLLM recipe is based on work by Adel Moumen (2025).
+ASSET-specific segmentation, pooling and training extensions were added in 2026.

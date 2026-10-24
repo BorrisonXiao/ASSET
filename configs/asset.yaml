@@ -1,0 +1,394 @@
+# Final WavLM + Transformer-AR (local history 64) + BiGRU recipe.
+seed: 3407
+cache_folder: .cache/huggingface
+skip_final_test: False
+__set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
+
+####################### Experiment Configuration ###########################
+
+experiment_name: asset_ls960
+segmenter_mode: joint
+segmenter_backbone: transformer_ar
+output_folder: !ref results/<experiment_name>/<segmenter_mode>/<seed>
+output_wer_folder: !ref <output_folder>/wer_results
+save_folder: !ref <output_folder>/save
+train_log: !ref <output_folder>/train_log.txt
+stage_timing_file: null           # optional JSONL, used by matched speed validation
+eval_only: False                  # recover a checkpoint and evaluate without fitting
+inference_benchmark_file: null    # optional JSONL summary, one row per test split
+inference_warmup_batches: 5       # excluded from latency/throughput summaries
+feats_cache_dir: null
+ckpt_interval_minutes: 15
+
+# For joint mode: directory of the cold-start run's checkpoints (its <save_folder>),
+# from which the segmenter state dict is loaded. Leave null for coldstart mode.
+coldstart_ckpt_dir: null
+# Preferred exact warm starts for oracle-close RL. When set, the segmenter path
+# takes precedence over coldstart_ckpt_dir; the decoder directory supplies the
+# projection, LoRA adapter, and normalization state.
+segmenter_init_checkpoint: null
+decoder_init_ckpt_dir: null
+
+####################### Segmenter Configuration ############################
+
+# Boundary policy backbone.
+segmenter_hidden_dim: 256
+segmenter_kernel_size: 7          # cnn only
+segmenter_num_layers: 4           # transformer only
+segmenter_nhead: 4                # transformer only
+segmenter_ffn_dim: 1024           # transformer only
+segmenter_dropout: 0.1
+segmenter_num_tasks: 1            # >1 enables FiLM task-conditioning (future)
+segmenter_sampling: autoregressive
+
+# Segment pooling. Order-aware modes add a zero-initialized residual to the
+# original mean, so old segmenter + decoder checkpoints remain exact warm starts.
+# The pooler consumes the decoder SSL stream (ssl_feat_dims), which may differ
+# from segmenter_input_dim in the wav2vec2-boundaries -> WavLM-pooling setup.
+segment_pooling: bigru_residual
+segment_pooling_hidden_dim: 128
+segment_pooling_num_layers: 1
+segment_pooling_dropout: 0.0
+
+# Recognizer initialization and optional fixed-boundary support. ``freeze_boundary_policy`` freezes the FiLM and
+# boundary-policy parameters while leaving the pooler and decoder trainable for
+# CE adaptation. When ``fixed_rate_k`` is set, deterministic fixed-stride
+# boundaries replace the learned policy at both training and evaluation time.
+# A fixed rate is only valid with a frozen boundary policy.
+freeze_boundary_policy: False
+fixed_rate_k: null
+
+# Full-prefix label-autoregressive Transformer. These are intentionally separate
+# from the bidirectional acoustic Transformer above; policy dropout starts at zero
+# so cached rollouts and parallel re-scoring use the same on-policy distribution.
+segmenter_ar_hidden_dim: 256
+segmenter_ar_num_layers: 4
+segmenter_ar_nhead: 4
+segmenter_ar_ffn_dim: 1024
+segmenter_ar_dropout: 0.0
+segmenter_ar_max_positions: 4096
+# Production Transformer-AR defaults: fixed local history and preallocated KV.
+# Override explicitly only for a matched full-history/runtime ablation.
+segmenter_ar_history_window: 64    # 64 production default; null = full history
+segmenter_ar_cache_mode: preallocated  # concat | preallocated
+
+# --- joint: GRPO policy-gradient ---
+grpo_k: 4                         # fixed current control; do not reduce for speed studies
+grpo_normalize_std: True         # GRPO (std-norm) vs RLOO (mean-only)
+pg_weight: 1.0
+warmup_epochs: 0
+# Optional finer-grained schedule for full-corpus runs. When set, this takes
+# precedence over warmup_epochs and uses this fraction of the first epoch's
+# optimizer updates for decoder-only adaptation before switching to joint RL.
+warmup_fraction_of_epoch: 0.20
+warmup_optimizer_steps: null     # resolved at runtime from the dynamic sampler
+# Optional optimizer-step-controlled validation for long full-corpus runs.
+# The overall stop is the SpeechBrain run option --optimizer_step_limit.
+validation_interval_optimizer_steps: 0
+validate_at_warmup_end: True
+# Share greedy + K sampled rollouts and score K rewards in one wide decoder call.
+# Every update uses fresh, on-policy samples.
+rl_update_mode: combined_on_policy
+
+# --- joint: rate objective (KEPT = band; free inside [rho_lo,rho_hi], penalize outside) ---
+# Aux-only by default; reward/both require explicit user instruction.
+rate_channel: aux
+rate_mode: band                  # pin | captax | band  (null -> derive from rate_two_sided)
+rate_two_sided: False            # legacy flag (used only when rate_mode is null)
+rho_star: 0.2                    # target (pin) / ceiling (captax)
+lambda_cap: 1.0                  # pin / cap / out-of-band weight
+lambda_press: 0.02               # token-tax (captax only)
+rho_floor: 0.08                  # soft lower floor (captax only)
+lambda_floor: 0.0                # floor weight (captax sets >0)
+rho_lo: 0.15
+rho_hi: 0.25
+
+# --- entropy bonus DROPPED (per-frame entropy pushes p->0.5, smearing the sharp
+#     cold-start boundaries into uniform mush -> argmax collapse). 0 = off. ---
+entropy_coeff_init: 0.0
+entropy_coeff_final: 0.0
+
+# --- reward / multi-task ablation switches ---
+# segmenter_reward: nll (teacher-forced -NLL) | cer | wer (free-running decode error).
+segmenter_reward: nll
+# freeze_decoder_in_joint: True = decoder frozen during the joint phase (RL vs a fixed
+# warmup decoder = single-task); False = decoder co-trained by CE (multi-task).
+freeze_decoder_in_joint: False
+
+####################### Data Configuration #################################
+
+data_folder: data/LibriSpeech
+train_splits: ["train-clean-100", "train-clean-360", "train-other-500"]
+dev_splits: ["dev-clean"]
+test_splits: ["test-clean", "test-other"]
+skip_prep: False
+csv_folder: !ref <output_folder>
+train_csv: !ref <csv_folder>/train.csv
+valid_csv: !ref <csv_folder>/dev-clean.csv
+test_csv:
+    - !ref <csv_folder>/test-clean.csv
+    - !ref <csv_folder>/test-other.csv
+
+# Char-level CTC boundaries drive the cold-start BCE (warmstart_target=alignment wires
+# the per-utterance <id>.pt loader in the shared dataio_prepare). In joint mode,
+# boundary_source: alignment instead uses those precomputed boundaries directly while
+# training the pooler/decoder; this requires freeze_boundary_policy: True.
+boundary_source: none  # none | alignment
+warmstart_target: none
+boundary_target_dir: data/boundaries/char
+
+####################### Model Paths & Configuration ########################
+
+ssl_hub: microsoft/wavlm-large
+ssl_folder: !ref <cache_folder>
+ssl_frozen: True
+ssl_device: cuda
+ssl_output_norm: True
+use_feats: False
+llm_device: cuda
+
+# Optional second frozen SSL encoder used only by the boundary predictor. When null,
+# the segmenter and decoder share `ssl` exactly as before. In dual-SSL mode the code
+# asserts that both encoders emit the same frame grid before transferring boundaries.
+segmenter_ssl_hub: null
+segmenter_ssl_folder: !ref <cache_folder>
+segmenter_ssl_frozen: True
+segmenter_ssl_device: cuda
+segmenter_ssl_output_norm: True
+
+llm_path: meta-llama/Llama-3.2-1B-Instruct
+llm_emb_size: 2048
+llm_save_path: !ref <cache_folder>
+
+####################### Training Hyperparameters ###########################
+
+number_of_epochs: 1
+checkpoints_to_keep: 1
+# When set in eval-only mode, load this zero-based validation-WER rank rather
+# than implicitly evaluating only the best retained checkpoint.
+eval_checkpoint_rank: null
+batch_size: 16
+grad_accumulation_factor: 1
+sorting: random
+num_workers: 4
+pin_memory: True
+persistent_workers: True
+prefetch_factor: 2
+precision: bf16
+eval_precision: bf16
+max_grad_norm: 1.0
+
+# Separate LRs: small for the segmenter policy, larger for the decoder (proj+LoRA).
+initial_lr: !ref <lr_decoder>
+lr_segmenter: 0.00005
+lr_decoder: 0.0002
+# Optional decoder-only warmup LR. Joint-RL always switches to lr_decoder.
+lr_decoder_warmup: !ref <lr_decoder>
+weight_decay: 0.0
+
+####################### Feature & Audio Parameters #########################
+
+downsampling_factor: 1
+
+####################### Dynamic Batching Configuration ######################
+
+dynamic_batching: True
+max_batch_length_train: 300
+max_batch_length_val: 100
+num_bucket: 200
+shuffle: True
+batch_ordering: random
+max_batch_ex: 256
+min_batch_ex_train: 2
+
+dynamic_batch_sampler_train:
+    max_batch_length: !ref <max_batch_length_train>
+    num_buckets: !ref <num_bucket>
+    shuffle: !ref <shuffle>
+    batch_ordering: !ref <batch_ordering>
+    max_batch_ex: !ref <max_batch_ex>
+    min_batch_ex: !ref <min_batch_ex_train>
+
+dynamic_batch_sampler_valid:
+    max_batch_length: !ref <max_batch_length_val>
+    num_buckets: !ref <num_bucket>
+    shuffle: !ref <shuffle>
+    batch_ordering: !ref <batch_ordering>
+    max_batch_ex: !ref <max_batch_ex>
+
+####################### DataLoader Configuration ##########################
+ignore_index: -100
+test_batch_size: 8
+
+train_dataloader_opts:
+    batch_size: !ref <batch_size>
+    shuffle: True
+    num_workers: !ref <num_workers>
+    drop_last: True   # avoid batch-size-1 std degeneracy in the GRPO group baseline
+    collate_fn: !name:speechbrain.dataio.batch.PaddedBatch
+        per_key_padding_kwargs:
+            sig:
+                value: 0
+            tokens_eos:
+                value: !ref <ignore_index>
+
+valid_dataloader_opts:
+    batch_size: !ref <test_batch_size>
+    num_workers: 0
+    collate_fn: !name:speechbrain.dataio.batch.PaddedBatch
+        per_key_padding_kwargs:
+            sig:
+                value: 0
+            tokens_eos:
+                value: !ref <ignore_index>
+
+test_dataloader_opts:
+    batch_size: !ref <test_batch_size>
+    num_workers: 0
+    collate_fn: !name:speechbrain.dataio.batch.PaddedBatch
+        per_key_padding_kwargs:
+            sig:
+                value: 0
+            tokens_eos:
+                value: !ref <ignore_index>
+
+####################### Model Architecture Parameters #######################
+
+bos_index: 128000
+eos_index: 128001
+pad_token: 128004
+prompt: "Transcribe speech to text."
+
+# Legacy ratio fields remain for compatibility with SpeechBrain's base class.
+# The batch-invariant searcher uses one cap per utterance from original waveform
+# duration, independent of batch padding and the number of pooled audio tokens.
+min_decode_ratio: 0.0
+max_decode_ratio: 3.0
+decode_sample_rate: 16000
+max_decode_tokens_per_second: 12.0
+max_decode_token_margin: 16
+min_decode_tokens: 8
+max_decode_tokens: 512
+
+####################### Model Components ####################################
+
+normalize: !new:speechbrain.processing.features.InputNormalization
+    norm_type: sentence
+
+ssl: !new:speechbrain.integrations.huggingface.wav2vec2.Wav2Vec2
+    source: !ref <ssl_hub>
+    output_norm: !ref <ssl_output_norm>
+    freeze: !ref <ssl_frozen>
+    save_path: !ref <ssl_folder>
+    device_map: !ref <ssl_device>
+ssl_feat_dims: 1024
+segmenter_input_dim: !ref <ssl_feat_dims>
+
+# The learned segmenter (boundary policy + configurable segment pooling).
+segmenter: !new:segmenter.Segmenter
+    input_dim: !ref <segmenter_input_dim>
+    backbone: !ref <segmenter_backbone>
+    hidden_dim: !ref <segmenter_hidden_dim>
+    kernel_size: !ref <segmenter_kernel_size>
+    num_layers: !ref <segmenter_num_layers>
+    nhead: !ref <segmenter_nhead>
+    ffn_dim: !ref <segmenter_ffn_dim>
+    dropout: !ref <segmenter_dropout>
+    num_tasks: !ref <segmenter_num_tasks>
+    sampling_strategy: !ref <segmenter_sampling>
+    ar_hidden_dim: !ref <segmenter_ar_hidden_dim>
+    ar_num_layers: !ref <segmenter_ar_num_layers>
+    ar_nhead: !ref <segmenter_ar_nhead>
+    ar_ffn_dim: !ref <segmenter_ar_ffn_dim>
+    ar_dropout: !ref <segmenter_ar_dropout>
+    ar_max_positions: !ref <segmenter_ar_max_positions>
+    ar_history_window: !ref <segmenter_ar_history_window>
+    ar_cache_mode: !ref <segmenter_ar_cache_mode>
+    pooling: !ref <segment_pooling>
+    pooling_input_dim: !ref <ssl_feat_dims>
+    pooling_hidden_dim: !ref <segment_pooling_hidden_dim>
+    pooling_num_layers: !ref <segment_pooling_num_layers>
+    pooling_dropout: !ref <segment_pooling_dropout>
+
+activation: !name:torch.nn.ReLU
+dnn_layers: 2
+dnn_neurons: !ref <llm_emb_size>
+proj: !new:speechbrain.lobes.models.VanillaNN.VanillaNN
+    input_shape: [null, null, !ref <ssl_feat_dims>]
+    activation: !ref <activation>
+    dnn_blocks: !ref <dnn_layers>
+    dnn_neurons: !ref <dnn_neurons>
+
+backbone_llm: !new:speechbrain.integrations.huggingface.llama.LLaMA
+    source: !ref <llm_path>
+    save_path: !ref <llm_save_path>
+    freeze: True
+    attn_implementation: sdpa
+    device: !ref <llm_device>
+    torch_dtype: !name:torch.bfloat16
+    additional_special_tokens:
+        - "<|start_of_audio|>"
+        - "<|end_of_audio|>"
+    output_hidden_states: False
+
+lora_rank: 16
+llm: !new:speechbrain.nnet.adapters.AdaptedModel
+    model_to_adapt: !ref <backbone_llm>
+    adapter_class: !name:speechbrain.nnet.adapters.LoRA
+    all_linear: True
+    adapter_kwargs:
+        rank: !ref <lora_rank>
+
+searcher: !new:batch_invariant_decode.BatchInvariantLLMGreedySearcher
+    llm_model: !ref <llm>
+    temperature: 0.0
+    min_decode_ratio: !ref <min_decode_ratio>
+    max_decode_ratio: !ref <max_decode_ratio>
+    bos_index: !ref <bos_index>
+    eos_index: !ref <eos_index>
+    max_decode_tokens_per_second: !ref <max_decode_tokens_per_second>
+    max_decode_token_margin: !ref <max_decode_token_margin>
+    min_decode_tokens: !ref <min_decode_tokens>
+    max_decode_tokens: !ref <max_decode_tokens>
+
+modules:
+    ssl: !ref <ssl>
+    segmenter: !ref <segmenter>
+    llm: !ref <llm>
+    proj: !ref <proj>
+    normalize: !ref <normalize>
+    searcher: !ref <searcher>
+
+####################### Optimizers ############################
+
+opt_segmenter: !name:torch.optim.AdamW
+    lr: !ref <lr_segmenter>
+    weight_decay: !ref <weight_decay>
+
+opt_decoder: !name:torch.optim.AdamW
+    lr: !ref <lr_decoder>
+    weight_decay: !ref <weight_decay>
+
+####################### Checkpointing & Logging #############################
+
+# proj + llm are added as recoverables only in joint mode (see init_optimizers),
+# so a cold-start run does not save a 2.5 GB untrained-LLM copy per checkpoint.
+checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
+    checkpoints_dir: !ref <save_folder>
+    recoverables:
+        segmenter: !ref <segmenter>
+        counter: !ref <epoch_counter>
+        normalize: !ref <normalize>
+
+epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
+    limit: !ref <number_of_epochs>
+
+train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
+    save_file: !ref <train_log>
+
+####################### Metrics #############################################
+
+cer_computer: !name:speechbrain.utils.metric_stats.ErrorRateStats
+    split_tokens: True
+
+error_rate_computer: !name:speechbrain.utils.metric_stats.ErrorRateStats
